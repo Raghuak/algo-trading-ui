@@ -20,6 +20,40 @@ const DAILY_MAX_LOSS = Number(process.env.NEXT_PUBLIC_DAILY_MAX_LOSS ?? 5000);
 const MARGIN_WARN_PCT = Number(process.env.NEXT_PUBLIC_MARGIN_WARN_PCT ?? 90); // breach when >=
 const WARN_FRACTION = 0.8; // 80% for amber pre-warning
 
+// ================== TYPES ==================
+type Side = "Buy" | "Sell";
+
+export type TickMsg = { type: "tick"; symbol: "NIFTY" | "BANKNIFTY"; ltp: number; t: number };
+export type SignalPayload = { symbol: string; side: Side; qty: number; price: number; status: string };
+export type SignalMsg = { type: "signal"; instrument: "NIFTY" | "BANKNIFTY"; payload: SignalPayload };
+export type RiskMsg = { type: "risk"; dailyLoss?: number; marginUsedPct?: number };
+export type StreamMsg = TickMsg | SignalMsg | RiskMsg;
+
+function isObject(x: unknown): x is Record<string, unknown> {
+  return typeof x === "object" && x !== null;
+}
+function isTickMsg(x: unknown): x is TickMsg {
+  return isObject(x) && x.type === "tick" && (x.symbol === "NIFTY" || x.symbol === "BANKNIFTY") && typeof x.ltp === "number" && typeof x.t === "number";
+}
+function isSignalMsg(x: unknown): x is SignalMsg {
+  if (!isObject(x) || x.type !== "signal") return false;
+  const inst = (x as Record<string, unknown>).instrument;
+  const payload = (x as Record<string, unknown>).payload;
+  if (inst !== "NIFTY" && inst !== "BANKNIFTY") return false;
+  if (!isObject(payload)) return false;
+  const p = payload as Record<string, unknown>;
+  return typeof p.symbol === "string" && (p.side === "Buy" || p.side === "Sell") && typeof p.qty === "number" && typeof p.price === "number" && typeof p.status === "string";
+}
+function isRiskMsg(x: unknown): x is RiskMsg {
+  return isObject(x) && x.type === "risk" && (typeof x.dailyLoss === "number" || typeof x.dailyLoss === "undefined") && (typeof x.marginUsedPct === "number" || typeof x.marginUsedPct === "undefined");
+}
+function asStreamMsg(x: unknown): StreamMsg | null {
+  if (isTickMsg(x)) return x;
+  if (isSignalMsg(x)) return x;
+  if (isRiskMsg(x)) return x;
+  return null;
+}
+
 // ================== UTILITIES ==================
 const formatINR = (n: number) =>
   new Intl.NumberFormat("en-IN", {
@@ -31,7 +65,7 @@ const formatINR = (n: number) =>
 function clamp(n: number, min: number, max: number) { return Math.max(min, Math.min(max, n)); }
 
 // P&L % calculation per side
-function calcPnLPct(side: "Buy" | "Sell", avgPrice: number, ltp: number) {
+function calcPnLPct(side: Side, avgPrice: number, ltp: number) {
   if (!avgPrice) return 0;
   return side === "Buy"
     ? ((ltp - avgPrice) / avgPrice) * 100
@@ -39,14 +73,14 @@ function calcPnLPct(side: "Buy" | "Sell", avgPrice: number, ltp: number) {
 }
 
 // Absolute P&L (no lot multiplier here; backend can provide if needed)
-function calcPnLAbs(side: "Buy" | "Sell", avgPrice: number, ltp: number, qty: number) {
+function calcPnLAbs(side: Side, avgPrice: number, ltp: number, qty: number) {
   const diff = side === "Buy" ? (ltp - avgPrice) : (avgPrice - ltp);
   return diff * qty;
 }
 
 // Throttle state updates to animation frames
 function useRafThrottle<T>(value: T, fps = UI_FPS) {
-  const [throttled, setThrottled] = useState(value);
+  const [throttled, setThrottled] = useState<T>(value);
   const lastRaf = useRef<number | null>(null);
   const lastTime = useRef<number>(0);
   const interval = 1000 / fps;
@@ -72,7 +106,7 @@ function useRafThrottle<T>(value: T, fps = UI_FPS) {
 }
 
 // CSV helpers
-function csvEscape(val: any) {
+function csvEscape(val: unknown) {
   const s = String(val ?? "");
   if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
   return s;
@@ -102,20 +136,20 @@ function pushBounded<T>(arr: T[], item: T, max: number): T[] {
 // ================== WEBSOCKET SHIM (with mock toggle) ==================
 interface WSHandlers {
   onOpen?: () => void;
-  onMessage?: (msg: any) => void;
-  onError?: (e: any) => void;
+  onMessage?: (msg: StreamMsg) => void;
+  onError?: (e: unknown) => void;
   onReconnect?: (attempt: number, delayMs: number) => void;
 }
 
-function createMarketStream(url: string, handlers: WSHandlers, useMock: boolean) {
+function createMarketStream(url: string, handlers: WSHandlers, useMock: boolean): () => void {
   let ws: WebSocket | null = null;
   let closed = false;
-  let hbTimer: any = null;
+  let hbTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectAttempt = 0;
 
   function heartbeat() {
     if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send(JSON.stringify({ type: "ping", t: Date.now() })); } catch {}
+      try { ws.send(JSON.stringify({ type: "ping", t: Date.now() })); } catch { /* noop */ }
     }
   }
 
@@ -124,15 +158,26 @@ function createMarketStream(url: string, handlers: WSHandlers, useMock: boolean)
       // Mock tick stream: emits ticks for NIFTY/BANKNIFTY + random signals
       const mockTimer = setInterval(() => {
         const t = Date.now();
-        const payloads = [
+        const payloads: TickMsg[] = [
           { type: "tick", symbol: "NIFTY", ltp: 22400 + (Math.random() - 0.5) * 8, t },
           { type: "tick", symbol: "BANKNIFTY", ltp: 48200 + (Math.random() - 0.5) * 16, t },
         ];
         for (const p of payloads) handlers.onMessage?.(p);
         if (Math.random() > 0.99) {
-          const side = Math.random() > 0.5 ? "Buy" : "Sell";
-          handlers.onMessage?.({ type: "signal", instrument: Math.random() > 0.5 ? "NIFTY" : "BANKNIFTY", 
-            payload: { symbol: side === "Buy" ? "NIFTY24SEP22500CE" : "NIFTY24SEP22500PE", side, qty: side === "Buy" ? 50 : 50, price: +(224 + (Math.random()-0.5)*2).toFixed(2), status: "Executed" } });
+          const side: Side = Math.random() > 0.5 ? "Buy" : "Sell";
+          const inst = Math.random() > 0.5 ? "NIFTY" : "BANKNIFTY";
+          const msg: SignalMsg = {
+            type: "signal",
+            instrument: inst,
+            payload: {
+              symbol: side === "Buy" ? `${inst}24SEP22500CE` : `${inst}24SEP22500PE`,
+              side,
+              qty: 50,
+              price: +(224 + (Math.random() - 0.5) * 2).toFixed(2),
+              status: "Executed",
+            },
+          };
+          handlers.onMessage?.(msg);
         }
       }, 100);
       handlers.onOpen?.();
@@ -146,10 +191,13 @@ function createMarketStream(url: string, handlers: WSHandlers, useMock: boolean)
         handlers.onOpen?.();
         hbTimer = setInterval(heartbeat, 15000);
       };
-      ws.onmessage = (ev) => {
-        try { handlers.onMessage?.(JSON.parse(ev.data)); } catch { handlers.onMessage?.(ev.data); }
+      ws.onmessage = (ev: MessageEvent) => {
+        let parsed: unknown = ev.data;
+        try { parsed = JSON.parse(ev.data as string); } catch { /* keep as-is */ }
+        const coerced = asStreamMsg(parsed);
+        if (coerced) handlers.onMessage?.(coerced);
       };
-      ws.onerror = (e) => handlers.onError?.(e);
+      ws.onerror = () => handlers.onError?.(new Error("ws error"));
       ws.onclose = () => {
         if (closed) return;
         const delay = Math.min(30000, Math.pow(2, reconnectAttempt) * 500 + Math.random() * 300);
@@ -164,45 +212,62 @@ function createMarketStream(url: string, handlers: WSHandlers, useMock: boolean)
     return () => {
       closed = true;
       if (hbTimer) clearInterval(hbTimer);
-      try { ws?.close(); } catch {}
+      try { ws?.close(); } catch { /* noop */ }
     };
   }
 
   const teardown = connect();
-  return () => { try { teardown && teardown(); } catch {} };
+  return () => { try { if (typeof teardown === 'function') teardown(); } catch { /* noop */ } };
 }
 
 // ================== FAST CHART (Lightweight-Charts with safe init) ==================
+
+type SeriesPoint = { time: number; value: number };
+interface SeriesApi { setData: (data: SeriesPoint[]) => void }
+interface ChartApi {
+  addLineSeries?: (opts?: { lineWidth?: number }) => SeriesApi;
+  addAreaSeries?: (opts?: { lineWidth?: number }) => SeriesApi;
+  applyOptions: (opts: Record<string, unknown>) => void;
+  timeScale: () => { fitContent: () => void };
+  remove?: () => void;
+}
+
+type CreateChartFn = (el: HTMLElement, opts?: Record<string, unknown>) => ChartApi;
+interface LWModuleShape {
+  createChart?: CreateChartFn;
+  default?: unknown;
+  LightweightCharts?: { createChart?: CreateChartFn };
+}
+
 function FastLineChart({
   series,
   theme = "dark",
 }: {
-  series: { time: number; value: number }[];
+  series: SeriesPoint[];
   theme?: "light" | "dark";
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const chartRef = useRef<any>(null);
-  const seriesRef = useRef<any>(null);
+  const chartRef = useRef<ChartApi | null>(null);
+  const seriesRef = useRef<SeriesApi | null>(null);
   const resizeObs = useRef<ResizeObserver | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current) return;
+    const el = containerRef.current;
+    if (!el) return;
 
     let cleanup: (() => void) | undefined;
     (async () => {
-      const mod: any = await import("lightweight-charts");
-      // Try multiple shapes: ESM, UMD, default-as-fn
-      const create: any =
+      const mod = (await import("lightweight-charts")) as unknown as LWModuleShape;
+      const create: CreateChartFn | undefined =
         (typeof mod?.createChart === "function" && mod.createChart) ||
         (typeof mod?.LightweightCharts?.createChart === "function" && mod.LightweightCharts.createChart) ||
-        (typeof mod?.default === "function" && mod.default) ||
-        (typeof mod?.default?.createChart === "function" && mod.default.createChart);
+        (typeof mod?.default === "function" && (mod.default as CreateChartFn)) ||
+        (typeof (mod?.default as LWModuleShape | undefined)?.createChart === "function" && (mod.default as LWModuleShape).createChart);
       if (typeof create !== "function") {
         console.error("[Chart] createChart not found on module", mod);
         return;
       }
 
-      const el = containerRef.current as HTMLDivElement;
       const chart = create(el, {
         width: el.clientWidth || 600,
         height: el.clientHeight || 256,
@@ -219,11 +284,11 @@ function FastLineChart({
         crosshair: { mode: 0 },
       });
 
-      let line: any = null;
-      if (typeof (chart as any).addLineSeries === "function") {
-        line = (chart as any).addLineSeries({ lineWidth: 2 });
-      } else if (typeof (chart as any).addAreaSeries === "function") {
-        line = (chart as any).addAreaSeries({ lineWidth: 2 });
+      let line: SeriesApi | null = null;
+      if (typeof chart.addLineSeries === "function") {
+        line = chart.addLineSeries({ lineWidth: 2 });
+      } else if (typeof chart.addAreaSeries === "function") {
+        line = chart.addAreaSeries({ lineWidth: 2 });
       } else {
         console.error("[Chart] Chart instance missing series methods; got:", chart);
         return;
@@ -233,11 +298,11 @@ function FastLineChart({
       seriesRef.current = line;
 
       if (Array.isArray(series)) {
-        if (typeof line.setData === "function") line.setData(series);
+        line.setData(series);
       }
 
       if (typeof ResizeObserver !== "undefined") {
-        resizeObs.current = new ResizeObserver((entries) => {
+        const ro = new ResizeObserver((entries) => {
           for (const entry of entries) {
             const cr = entry.contentRect;
             if (cr.width > 0 && cr.height > 0) {
@@ -245,7 +310,8 @@ function FastLineChart({
             }
           }
         });
-        resizeObs.current.observe(el);
+        resizeObs.current = ro;
+        ro.observe(el);
       } else {
         const onResize = () => {
           const { clientWidth, clientHeight } = el;
@@ -257,8 +323,9 @@ function FastLineChart({
     })();
 
     return () => {
-      if (resizeObs.current && containerRef.current) {
-        resizeObs.current.unobserve(containerRef.current);
+      const currentEl = el; // capture
+      if (resizeObs.current && currentEl) {
+        try { resizeObs.current.unobserve(currentEl); } catch { /* noop */ }
         resizeObs.current.disconnect();
         resizeObs.current = null;
       }
@@ -266,7 +333,7 @@ function FastLineChart({
         if (chartRef.current && typeof chartRef.current.remove === "function") {
           chartRef.current.remove();
         }
-      } catch {}
+      } catch { /* noop */ }
       chartRef.current = null;
       seriesRef.current = null;
       if (cleanup) cleanup();
@@ -274,13 +341,9 @@ function FastLineChart({
   }, [theme]);
 
   useEffect(() => {
-    if (seriesRef.current && typeof seriesRef.current.setData === "function") {
+    if (seriesRef.current) {
       seriesRef.current.setData(series);
-      if (chartRef.current?.timeScale?.().fitContent) {
-        try {
-          chartRef.current.timeScale().fitContent();
-        } catch {}
-      }
+      try { chartRef.current?.timeScale().fitContent(); } catch { /* noop */ }
     }
   }, [series]);
 
@@ -288,7 +351,7 @@ function FastLineChart({
 }
 
 // ================== UI SUBCOMPONENTS ==================
-const SideBadge = ({ side }: { side: "Buy" | "Sell" }) => (
+const SideBadge = ({ side }: { side: Side }) => (
   <span className={`px-2 py-0.5 text-xs rounded font-semibold ${side === "Buy" ? "bg-green-600/20 text-green-500" : "bg-red-600/20 text-red-500"}`}>
     {side.toUpperCase()}
   </span>
@@ -299,7 +362,7 @@ const TradeRow = React.memo(function TradeRow({
   t,
   showAbs,
 }: {
-  t: { symbol: string; side: "Buy" | "Sell"; qty: number; avgPrice: number; ltp: number; status: string };
+  t: { symbol: string; side: Side; qty: number; avgPrice: number; ltp: number; status: string };
   showAbs: boolean;
 }) {
   const pnlPct = calcPnLPct(t.side, t.avgPrice, t.ltp);
@@ -345,8 +408,8 @@ export default function TradingDashboard() {
   const [marginUsedPct, setMarginUsedPct] = useState(40);
 
   // Per-instrument state
-  type Signal = { symbol: string; side: "Buy" | "Sell"; qty: number; price: number; status: string };
-  type Trade = { symbol: string; side: "Buy" | "Sell"; qty: number; avgPrice: number; ltp: number; status: string };
+  type Signal = SignalPayload;
+  type Trade = { symbol: string; side: Side; qty: number; avgPrice: number; ltp: number; status: string };
 
   const [signalsN, setSignalsN] = useState<Signal[]>([]);
   const [tradesN, setTradesN] = useState<Trade[]>([]);
@@ -376,8 +439,8 @@ export default function TradingDashboard() {
       // CSV tests
       const csv = toCSV(["a","b"], [["x, y","\"z\""]]);
       console.assert(/\"x, y\"/.test(csv) && /\"\"z\"\"/.test(csv), "[TEST] CSV escaping");
-    } catch (e) {
-      console.error("[TEST] self-tests failed", e);
+    } catch (err) {
+      console.error("[TEST] self-tests failed", err);
     }
   }, []);
 
@@ -385,37 +448,46 @@ export default function TradingDashboard() {
   useEffect(() => {
     const teardown = createMarketStream(WS_URL, {
       onOpen: () => setSysLogs((l) => pushBounded(l, new Date().toLocaleTimeString() + " - stream connected", MAX_SYS_LOGS)),
-      onError: (e) => setSysLogs((l) => pushBounded(l, new Date().toLocaleTimeString() + " - stream error", MAX_SYS_LOGS)),
+      onError: () => setSysLogs((l) => pushBounded(l, new Date().toLocaleTimeString() + " - stream error", MAX_SYS_LOGS)),
       onReconnect: (attempt, delay) => setSysLogs((l) => pushBounded(l, `${new Date().toLocaleTimeString()} - reconnect attempt ${attempt} in ${Math.round(delay)}ms`, MAX_SYS_LOGS)),
       onMessage: (msg) => {
         if (msg?.type === "tick") {
-          if (msg.symbol === "NIFTY") setMarketData((d) => ({ ...d, nifty: Number(msg.ltp.toFixed(2)) }));
-          if (msg.symbol === "BANKNIFTY") setMarketData((d) => ({ ...d, bankNifty: Number(msg.ltp.toFixed(2)) }));
+          const { symbol, ltp, t } = msg;
+          if (symbol === "NIFTY") setMarketData((d) => ({ ...d, nifty: Number(ltp.toFixed(2)) }));
+          if (symbol === "BANKNIFTY") setMarketData((d) => ({ ...d, bankNifty: Number(ltp.toFixed(2)) }));
 
-          // Update LTP for trades matching this underlying (simple match: contains NIFTY or BANKNIFTY)
-          const upd = (arr: Trade[]) => arr.map((t) =>
-            (t.symbol.includes(msg.symbol) ? { ...t, ltp: Number(msg.ltp.toFixed(2)) } : t)
-          );
+          const upd = (arr: Trade[]) => arr.map((tr) => (tr.symbol.includes(symbol) ? { ...tr, ltp: Number(ltp.toFixed(2)) } : tr));
           setTradesN((arr) => upd(arr));
           setTradesB((arr) => upd(arr));
+
+          // Log tick occasionally (every ~2s window)
+          if (t % 2000 < 120) {
+            const line = `${new Date(t).toLocaleTimeString()} ${symbol} ${ltp.toFixed(2)}`;
+            if (symbol === "NIFTY") setLogsN((x) => pushBounded(x, line, MAX_SYS_LOGS));
+            if (symbol === "BANKNIFTY") setLogsB((x) => pushBounded(x, line, MAX_SYS_LOGS));
+          }
         }
         if (msg?.type === "signal") {
-          const s: Signal = msg.payload;
-          if ((msg.instrument ?? "").includes("BANK")) {
+          const s = msg.payload;
+          const logLine = `${new Date().toLocaleTimeString()} ${msg.instrument} ${s.side} ${s.qty} ${s.symbol} @ ${s.price}`;
+          if (msg.instrument === "BANKNIFTY") {
             setSignalsB((x) => pushBounded(x, s, MAX_SIGNALS));
             setTradesB((t) => pushBounded(t, { symbol: s.symbol, side: s.side, qty: s.qty, avgPrice: s.price, ltp: s.price, status: s.status }, MAX_TRADE_LOGS));
+            setLogsB((x) => pushBounded(x, logLine, MAX_SYS_LOGS));
           } else {
             setSignalsN((x) => pushBounded(x, s, MAX_SIGNALS));
             setTradesN((t) => pushBounded(t, { symbol: s.symbol, side: s.side, qty: s.qty, avgPrice: s.price, ltp: s.price, status: s.status }, MAX_TRADE_LOGS));
+            setLogsN((x) => pushBounded(x, logLine, MAX_SYS_LOGS));
           }
         }
         if (msg?.type === "risk") {
           if (typeof msg.dailyLoss === 'number') setDailyLoss(msg.dailyLoss);
           if (typeof msg.marginUsedPct === 'number') setMarginUsedPct(msg.marginUsedPct);
+          setSysLogs((l) => pushBounded(l, `${new Date().toLocaleTimeString()} risk update`, MAX_SYS_LOGS));
         }
       },
     }, USE_MOCK);
-    return () => { teardown && teardown(); };
+    return () => { if (teardown) teardown(); };
   }, []);
 
   // Simulated risk drift (mock); your backend should push real numbers
